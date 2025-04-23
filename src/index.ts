@@ -18,7 +18,7 @@ const TRANSLATION_STATE_DIR = path.join(CACHE_DIR, 'chapters/translation-state')
 const COLLECTION_NAME = "the-dark-king-keywords"; // Example collection name
 const SOURCE_LANGUAGE = "English";
 const TARGET_LANGUAGE = "Turkish"; // Example target language
-const CONTEXT_WINDOW = 15; // Number of previous/future lines for context
+const CONTEXT_WINDOW = 8; // Number of previous/future lines for context
 
 // --- Caching Function ---
 async function cacheChapterUrls(): Promise<void> {
@@ -155,8 +155,8 @@ async function fetchAndProcessChapter(chapter: { chapter: number; url: string },
 async function translateChapter(chapterNumber: number, sourceFilePath: string): Promise<void> {
     const translatedFilePath = path.join(TRANSLATED_CHAPTERS_DIR, `chapter_${chapterNumber}.txt`);
     const stateFilePath = path.join(TRANSLATION_STATE_DIR, `chapter_${chapterNumber}.json`); // Path for the state file
-    const MAX_RETRIES = 5; // Maximum number of retries for a single line
-    const RETRY_DELAY_MS = 20000; // Delay between retries
+    const MAX_RETRIES = 2; // Maximum number of retries for a single line
+    const RETRY_DELAY_MS = 5000; // Delay between retries
 
     console.log(`--- Translating Chapter ${chapterNumber} ---`);
 
@@ -294,8 +294,8 @@ async function translateChapter(chapterNumber: number, sourceFilePath: string): 
                             attempts++;
                             console.error(`Error translating line ${i + 1} of Chapter ${chapterNumber} (Attempt ${attempts}/${MAX_RETRIES}):`, lineError);
                             if (attempts >= MAX_RETRIES) {
-                                console.error(`Max retries reached for line ${i + 1}. Marking as error.`);
-                                currentTranslatedLine = `[TRANSLATION_ERROR] ${currentLine}`;
+                                console.error(`Max retries reached for line ${i + 1}. Marking as untranslated.`);
+                                currentTranslatedLine = `NOT TRANSLATED: ${currentLine}`;
                             } else {
                                 console.log(`Retrying in ${RETRY_DELAY_MS / 1000} seconds...`);
                                 await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
@@ -347,7 +347,9 @@ async function generateTranslatedLine(
     currentLine: string,
     futureLines: string[]
 ): Promise<{ translatedLine: string; newKeywords: { from: string; to: string }[] }> {
-    const existingKeywords = await searchKeyword(collectionName, currentLine, 10);
+    console.log(`Generating translation for line: "${currentLine}"`);
+
+    const existingKeywords = await searchKeyword(collectionName, currentLine, 5);
 
     const prompt = `
 You will be translating a novel line by line.
@@ -355,6 +357,7 @@ You will be translating a novel line by line.
 Translate the "Current Line" from ${sourceLanguage} to ${targetLanguage}.
 Maintain consistency with the "Previous Lines" translations and consider the "Future Lines" for context.
 Use the "Existing Keywords" for consistent translation of specific terms or names.
+Dont forget existing keywords are not absolutely correct, just use them as a reference for consistency.
 Identify any new recurring terms or names in the "Current Line" that should be translated consistently in the future and list them as "New Keywords".
 
 Source Language: ${sourceLanguage}
@@ -395,7 +398,7 @@ If no new keywords are identified, provide an empty array for "newKeywords". Do 
 `;
 
     const result = await genAI.models.generateContent({
-        model: "models/gemini-2.5-flash-preview-04-17", // Consider trying other models if parsing issues persist
+        model: "models/gemini-2.5-flash-preview-04-17",
         contents: prompt,
         config: {
             responseMimeType: "application/json",
@@ -506,8 +509,6 @@ async function main() {
                     console.error(`Error accessing source file ${sourceFilePath} before translation:`, error);
                 }
             }
-
-            await new Promise(resolve => setTimeout(resolve, 500));
         }
 
         console.log("Processing and translation finished.");
