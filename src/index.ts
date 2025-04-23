@@ -5,7 +5,7 @@ import { JSDOM } from 'jsdom'; // Import JSDOM
 
 import { Type } from '@google/genai';
 import { genAI } from './genai';
-import { searchKeyword, addKeywordDocument } from './keywords'; // Import searchKeyword and addKeywordDocument
+import { searchKeyword, addKeywordDocument, fetchAllKeywordsAndSave } from './keywords';
 
 // --- Constants ---
 const NOVEL_BASE_URL = "https://www.lightnovelworld.com/novel/the-dark-king-16091324";
@@ -274,17 +274,17 @@ Identify any new recurring terms or names in the "Current Line" that should be t
 Source Language: ${sourceLanguage}
 Target Language: ${targetLanguage}
 
-Existing related Keywords:
-${existingKeywords.map(kw => `- "${kw.from}": "${kw.to}"`).join('\n') || 'None'}
+Existing Keywords:
+${existingKeywords.map(kw => `- ${kw.from}: ${kw.to}`).join('\n') || 'None'}
 
 Previous Lines (Source -> Target):
-${previousLines.map(line => `- "${line.from}" -> "${line.to}"`).join('\n') || 'None'}
+${previousLines.map(line => `- ${line.from} -> ${line.to}`).join('\n') || 'None'}
 
 Current Line (to be translated):
 ${currentLine}
 
 Future Lines (for context):
-${futureLines.map(line => `- "${line}"`).join('\n') || 'None'}
+${futureLines.map(line => `- ${line}`).join('\n') || 'None'}
 
 If no new keywords are identified, provide an empty array for "newKeywords".
 `;
@@ -333,8 +333,27 @@ If no new keywords are identified, provide an empty array for "newKeywords".
 // --- Main Execution ---
 async function main() {
     try {
+        // Ensure the output directories exist first
+        try {
+            await fs.mkdir(CACHE_DIR, { recursive: true }); // Ensure base cache dir exists
+            await fs.mkdir(PROCESSED_CHAPTERS_DIR, { recursive: true });
+            await fs.mkdir(TRANSLATED_CHAPTERS_DIR, { recursive: true });
+            // Keywords directory will be created by fetchAllKeywordsAndSave if needed
+            console.log(`Ensured output directories exist.`);
+        } catch (error) {
+            console.error(`Failed to create output directories:`, error);
+            process.exit(1);
+        }
+
+        // Fetch and save all existing keywords initially
+        console.log("Performing initial keyword backup...");
+        await fetchAllKeywordsAndSave(COLLECTION_NAME);
+        console.log("Initial keyword backup complete.");
+
+        // Step 1: Cache Chapter URLs if not already cached
         await cacheChapterUrls();
 
+        // Step 2: Read cache
         console.log("Reading chapter cache...");
         let chapters: { chapter: number; url: string }[] = [];
         try {
@@ -351,15 +370,7 @@ async function main() {
             return;
         }
 
-        try {
-            await fs.mkdir(PROCESSED_CHAPTERS_DIR, { recursive: true });
-            await fs.mkdir(TRANSLATED_CHAPTERS_DIR, { recursive: true });
-            console.log(`Ensured output directories exist: ${PROCESSED_CHAPTERS_DIR} and ${TRANSLATED_CHAPTERS_DIR}`);
-        } catch (error) {
-            console.error(`Failed to create output directories:`, error);
-            process.exit(1);
-        }
-
+        // Step 3: Process and Translate each chapter sequentially
         console.log("Starting chapter processing and translation...");
         for (const chapter of chapters) {
             const sourceFilePath = path.join(PROCESSED_CHAPTERS_DIR, `chapter_${chapter.chapter}.txt`);

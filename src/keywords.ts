@@ -1,4 +1,6 @@
 import { IncludeEnum } from "chromadb";
+import { promises as fs } from 'fs'; // Import fs promises
+import path from 'path'; // Import path
 import { getCollection } from "./chromadb";
 import { genAI } from "./genai";
 
@@ -11,10 +13,43 @@ interface Keyword {
 }
 
 /**
- * Adds a keyword document to the specified ChromaDB collection.
+ * Fetches all keyword documents from the specified collection, sorts them,
+ * and saves them to a JSON file in the process/keywords directory.
+ * @param collectionName The name of the ChromaDB collection.
+ */
+export const fetchAllKeywordsAndSave = async (collectionName: string): Promise<void> => {
+    try {
+        const collection = await getCollection(collectionName);
+        const allDocs = await collection.get({ include: [IncludeEnum.Metadatas] });
+        const allKeywords = allDocs.metadatas
+            .map(meta => meta as unknown as Keyword)
+            .filter(kw => kw && typeof kw.from === 'string' && typeof kw.to === 'string'); // Basic validation
+
+        // Sort keywords alphabetically by 'from' for consistency
+        allKeywords.sort((a, b) => a.from.localeCompare(b.from));
+
+        const keywordsDir = path.join(__dirname, '..', 'process', 'keywords');
+        const jsonFilePath = path.join(keywordsDir, `${collectionName}.json`);
+
+        // Ensure the directory exists
+        await fs.mkdir(keywordsDir, { recursive: true });
+
+        // Write the JSON file
+        await fs.writeFile(jsonFilePath, JSON.stringify(allKeywords, null, 2), 'utf8');
+    } catch (error) {
+        console.error(`Failed to fetch keywords or write JSON backup for ${collectionName}:`, error);
+        // Decide if this error should halt the process or just be logged
+        // Re-throwing might be appropriate if the initial keyword state is critical
+        // throw error;
+    }
+};
+
+/**
+ * Adds a keyword document to the specified ChromaDB collection and updates the JSON backup.
  * The embedding is generated based on the 'from' property, which is also used as the ID.
  * The entire keyword object is stored as metadata.
  * Uses models/text-embedding-004 for embedding.
+ * After adding, fetches all keywords and saves them to process/keywords/COLLECTION_NAME.json.
  * @param collectionName The name of the ChromaDB collection.
  * @param keyword The keyword object ({ from: string, to: string }) to add.
  */
@@ -39,6 +74,7 @@ export const addKeywordDocument = async (
         throw new Error("Failed to generate embedding");
     }
 
+    let addedSuccessfully = false;
     try {
         // Add the document to the collection
         await collection.add({
@@ -46,9 +82,15 @@ export const addKeywordDocument = async (
             embeddings: [embedding],
             metadatas: [keyword as any] // Store the original keyword object as metadata
         });
+        addedSuccessfully = true;
+        console.log(`Keyword document added to ${collectionName} with ID: ${keyword.from}`);
     } catch {}
 
-    console.log(`Keyword document added to ${collectionName} with ID: ${keyword.from}`);
+    // If added (or duplicate ignored), fetch all keywords and save to JSON
+    if (addedSuccessfully) {
+        // Call the extracted function
+        await fetchAllKeywordsAndSave(collectionName);
+    }
 };
 
 /**
