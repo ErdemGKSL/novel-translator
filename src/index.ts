@@ -14,6 +14,7 @@ const CACHE_DIR = path.join(__dirname, '..', 'process'); // Use path.join for cr
 const CHAPTER_CACHE_FILE = path.join(CACHE_DIR, 'chapter-cache.json');
 const PROCESSED_CHAPTERS_DIR = path.join(CACHE_DIR, 'chapters/source'); // Directory for processed text files
 const TRANSLATED_CHAPTERS_DIR = path.join(CACHE_DIR, 'chapters/translated'); // Directory for translated text files
+const TRANSLATION_STATE_DIR = path.join(CACHE_DIR, 'chapters/translation-state'); // Directory for temporary state files
 const COLLECTION_NAME = "the-dark-king-keywords"; // Example collection name
 const SOURCE_LANGUAGE = "English";
 const TARGET_LANGUAGE = "Turkish"; // Example target language
@@ -153,22 +154,45 @@ async function fetchAndProcessChapter(chapter: { chapter: number; url: string },
 // --- Translation Function ---
 async function translateChapter(chapterNumber: number, sourceFilePath: string): Promise<void> {
     const translatedFilePath = path.join(TRANSLATED_CHAPTERS_DIR, `chapter_${chapterNumber}.txt`);
+    const stateFilePath = path.join(TRANSLATION_STATE_DIR, `chapter_${chapterNumber}.json`); // Path for the state file
+    const MAX_RETRIES = 5; // Maximum number of retries for a single line
+    const RETRY_DELAY_MS = 20000; // Delay between retries
 
     console.log(`--- Translating Chapter ${chapterNumber} ---`);
 
-    // Check if translated file already exists
+    // Ensure state directory exists
+    try {
+        await fs.mkdir(TRANSLATION_STATE_DIR, { recursive: true });
+    } catch (dirError) {
+        console.error(`Failed to create translation state directory: ${TRANSLATION_STATE_DIR}`, dirError);
+    }
+
+    // Check if final translated file already exists
     try {
         await fs.access(translatedFilePath);
-        console.log(`Chapter ${chapterNumber} already translated. Skipping.`);
-        return; // Skip if translation exists
+        console.log(`Chapter ${chapterNumber} already fully translated. Skipping.`);
+        try {
+            await fs.unlink(stateFilePath);
+            console.log(`Cleaned up existing state file for chapter ${chapterNumber}.`);
+        } catch (unlinkError) {
+            if ((unlinkError as NodeJS.ErrnoException).code !== 'ENOENT') {
+                console.warn(`Could not delete state file ${stateFilePath}:`, unlinkError);
+            }
+        }
+        return; // Skip if final translation exists
     } catch (error) {
-        // Translated file doesn't exist, proceed with translation
+        // Final translated file doesn't exist, proceed
     }
+
+    let translatedLines: string[] = [];
+    let startIndex = 0;
+    const previousLinesBuffer: { from: string; to: string }[] = [];
+    const skipRegex = /^[ …\r\*]+$/; // Regex to match lines containing only spaces, ellipses, carriage returns, or asterisks
+    let sourceLines: string[] = [];
 
     try {
         const sourceContent = await fs.readFile(sourceFilePath, 'utf8');
-        // Keep original lines for regex check, split by any newline
-        const sourceLines = sourceContent.split(/\r?\n/);
+        sourceLines = sourceContent.split(/\r?\n/);
 
         if (sourceLines.length === 0) {
             console.log(`Chapter ${chapterNumber} source file is empty. Skipping translation.`);
@@ -176,74 +200,136 @@ async function translateChapter(chapterNumber: number, sourceFilePath: string): 
             return;
         }
 
-        const translatedLines: string[] = [];
-        const previousLinesBuffer: { from: string; to: string }[] = [];
-        const skipRegex = /^[ …\r\*]+$/; // Regex to match lines containing only spaces, ellipses, carriage returns, or asterisks
+        try {
+            const stateData = await fs.readFile(stateFilePath, 'utf8');
+            translatedLines = JSON.parse(stateData);
+            startIndex = translatedLines.length;
+            console.log(`Resuming translation for chapter ${chapterNumber} from line ${startIndex + 1}`);
 
-        for (let i = 0; i < sourceLines.length; i++) {
-            const originalLine = sourceLines[i];
+            const bufferStartIndex = Math.max(0, startIndex - CONTEXT_WINDOW);
+            for (let j = bufferStartIndex; j < startIndex; j++) {
+                if (j < sourceLines.length) {
+                    const originalLine = sourceLines[j];
+                    const sourceLineTrimmed = originalLine.trim();
+                    const translatedLine = translatedLines[j];
 
-            // Check if the original line matches the skip regex
-            if (skipRegex.test(originalLine)) {
-                translatedLines.push(originalLine); // Append the original line directly
-                console.log(`Skipping line ${i + 1} (matches regex) of Chapter ${chapterNumber}`);
-                continue; // Move to the next line
-            }
-
-            const currentLine = originalLine.trim();
-            if (!currentLine) {
-                // Handle lines that are empty or become empty after trimming
-                translatedLines.push(''); // Append an empty line to maintain spacing
-                continue;
-            }
-
-            const futureLines = sourceLines.slice(i + 1, i + 1 + CONTEXT_WINDOW)
-                .map(line => line.trim())
-                .filter(line => line && !skipRegex.test(line)); // Also filter future lines based on regex
-
-            console.log(`Translating line ${i + 1}/${sourceLines.length} of Chapter ${chapterNumber}`);
-            try {
-                const result = await generateTranslatedLine(
-                    COLLECTION_NAME,
-                    SOURCE_LANGUAGE,
-                    TARGET_LANGUAGE,
-                    previousLinesBuffer,
-                    currentLine,
-                    futureLines
-                );
-
-                translatedLines.push(result.translatedLine);
-
-                if (result.newKeywords && result.newKeywords.length > 0) {
-                    console.log(`Adding ${result.newKeywords.length} new keywords for Chapter ${chapterNumber}, Line ${i + 1}`);
-                    for (const keyword of result.newKeywords) {
-                        try {
-                            if (keyword.from.trim()) {
-                                await addKeywordDocument(COLLECTION_NAME, keyword);
-                            } else {
-                                console.warn(`Skipping empty 'from' keyword:`, keyword);
-                            }
-                        } catch (kwError) {
-                            console.error(`Failed to add keyword "${keyword.from}": "${keyword.to}"`, kwError);
+                    if (sourceLineTrimmed && !skipRegex.test(originalLine)) {
+                        previousLinesBuffer.push({ from: sourceLineTrimmed, to: translatedLine });
+                        if (previousLinesBuffer.length > CONTEXT_WINDOW) {
+                            previousLinesBuffer.shift();
                         }
                     }
+                } else {
+                    console.warn(`Source line index ${j} out of bounds while reconstructing buffer for chapter ${chapterNumber}.`);
                 }
-
-                previousLinesBuffer.push({ from: currentLine, to: result.translatedLine });
-                if (previousLinesBuffer.length > CONTEXT_WINDOW) {
-                    previousLinesBuffer.shift();
-                }
-            } catch (lineError) {
-                console.error(`Error translating line ${i + 1} of Chapter ${chapterNumber}:`, lineError);
-                translatedLines.push(`[TRANSLATION_ERROR] ${currentLine}`);
             }
-            await new Promise(resolve => setTimeout(resolve, 5000));
+            console.log(`Reconstructed previous lines buffer with ${previousLinesBuffer.length} entries.`);
+        } catch (stateReadError) {
+            if ((stateReadError as NodeJS.ErrnoException).code === 'ENOENT') {
+                console.log(`No existing translation state found for chapter ${chapterNumber}. Starting fresh.`);
+            } else if (stateReadError instanceof SyntaxError) {
+                console.error(`Error parsing state file ${stateFilePath}. Starting fresh. Error:`, stateReadError);
+            } else {
+                console.error(`Error reading state file ${stateFilePath}. Starting fresh. Error:`, stateReadError);
+            }
+            translatedLines = [];
+            startIndex = 0;
+            previousLinesBuffer.length = 0;
+        }
+
+        for (let i = startIndex; i < sourceLines.length; i++) {
+            const originalLine = sourceLines[i];
+            let currentTranslatedLine = "";
+
+            if (skipRegex.test(originalLine)) {
+                currentTranslatedLine = originalLine;
+                console.log(`Skipping line ${i + 1} (matches regex) of Chapter ${chapterNumber}`);
+            } else {
+                const currentLine = originalLine.trim();
+                if (!currentLine) {
+                    currentTranslatedLine = '';
+                } else {
+                    const futureLines = sourceLines.slice(i + 1, i + 1 + CONTEXT_WINDOW)
+                        .map(line => line.trim())
+                        .filter(line => line && !skipRegex.test(line));
+
+                    console.log(`Translating line ${i + 1}/${sourceLines.length} of Chapter ${chapterNumber}`);
+
+                    let success = false;
+                    let attempts = 0;
+                    while (attempts < MAX_RETRIES && !success) {
+                        try {
+                            const result = await generateTranslatedLine(
+                                COLLECTION_NAME,
+                                SOURCE_LANGUAGE,
+                                TARGET_LANGUAGE,
+                                previousLinesBuffer,
+                                currentLine,
+                                futureLines
+                            );
+
+                            currentTranslatedLine = result.translatedLine;
+
+                            if (result.newKeywords && result.newKeywords.length > 0) {
+                                console.log(`Adding ${result.newKeywords.length} new keywords for Chapter ${chapterNumber}, Line ${i + 1}`);
+                                for (const keyword of result.newKeywords) {
+                                    try {
+                                        if (keyword.from.trim()) {
+                                            await addKeywordDocument(COLLECTION_NAME, keyword);
+                                        } else {
+                                            console.warn(`Skipping empty 'from' keyword:`, keyword);
+                                        }
+                                    } catch (kwError) {
+                                        console.error(`Failed to add keyword "${keyword.from}": "${keyword.to}"`, kwError);
+                                    }
+                                }
+                            }
+
+                            previousLinesBuffer.push({ from: currentLine, to: result.translatedLine });
+                            if (previousLinesBuffer.length > CONTEXT_WINDOW) {
+                                previousLinesBuffer.shift();
+                            }
+                            success = true;
+                        } catch (lineError) {
+                            attempts++;
+                            console.error(`Error translating line ${i + 1} of Chapter ${chapterNumber} (Attempt ${attempts}/${MAX_RETRIES}):`, lineError);
+                            if (attempts >= MAX_RETRIES) {
+                                console.error(`Max retries reached for line ${i + 1}. Marking as error.`);
+                                currentTranslatedLine = `[TRANSLATION_ERROR] ${currentLine}`;
+                            } else {
+                                console.log(`Retrying in ${RETRY_DELAY_MS / 1000} seconds...`);
+                                await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
+                            }
+                        }
+                    }
+                    if (success || attempts >= MAX_RETRIES) {
+                        await new Promise(resolve => setTimeout(resolve, 5000));
+                    }
+                }
+            }
+
+            translatedLines.push(currentTranslatedLine);
+            try {
+                await fs.writeFile(stateFilePath, JSON.stringify(translatedLines, null, 2), 'utf8');
+            } catch (stateWriteError) {
+                console.error(`Failed to save translation state to ${stateFilePath} after line ${i + 1}:`, stateWriteError);
+            }
         }
 
         const translatedContent = translatedLines.join('\n');
         await fs.writeFile(translatedFilePath, translatedContent, 'utf8');
         console.log(`Successfully translated and saved Chapter ${chapterNumber} to ${translatedFilePath}`);
 
+        try {
+            await fs.unlink(stateFilePath);
+            console.log(`Successfully deleted state file ${stateFilePath}`);
+        } catch (unlinkError) {
+            if ((unlinkError as NodeJS.ErrnoException).code === 'ENOENT') {
+                console.log(`State file ${stateFilePath} was already deleted or never created.`);
+            } else {
+                console.error(`Failed to delete state file ${stateFilePath}:`, unlinkError);
+            }
+        }
     } catch (readError) {
         if ((readError as NodeJS.ErrnoException).code === 'ENOENT') {
             console.warn(`Source file ${sourceFilePath} not found for translation. Skipping Chapter ${chapterNumber}.`);
@@ -286,11 +372,30 @@ ${currentLine}
 Future Lines (for context):
 ${futureLines.map(line => `- ${line}`).join('\n') || 'None'}
 
-If no new keywords are identified, provide an empty array for "newKeywords".
+Respond ONLY with a valid JSON object matching this schema:
+{
+  "type": "object",
+  "properties": {
+    "translatedLine": { "type": "string" },
+    "newKeywords": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "from": { "type": "string" },
+          "to": { "type": "string" }
+        },
+        "required": ["from", "to"]
+      }
+    }
+  },
+  "required": ["translatedLine", "newKeywords"]
+}
+If no new keywords are identified, provide an empty array for "newKeywords". Do not include any other text or explanations outside the JSON object.
 `;
 
     const result = await genAI.models.generateContent({
-        model: "models/gemini-2.5-flash-preview-04-17",
+        model: "models/gemini-2.5-flash-preview-04-17", // Consider trying other models if parsing issues persist
         contents: prompt,
         config: {
             responseMimeType: "application/json",
@@ -314,11 +419,25 @@ If no new keywords are identified, provide an empty array for "newKeywords".
             }
         }
     });
+
+    if (!result || !result.text) {
+        console.error("Received empty or null response from AI.");
+        throw new Error("Received empty response from AI");
+    }
+
     const responseText = result.text;
 
     try {
-        const parsedResult = JSON.parse(responseText || "");
-        if (typeof parsedResult.translatedLine === 'string' && Array.isArray(parsedResult.newKeywords)) {
+        const parsedResult = JSON.parse(responseText);
+        if (
+            typeof parsedResult === 'object' &&
+            parsedResult !== null &&
+            typeof parsedResult.translatedLine === 'string' &&
+            Array.isArray(parsedResult.newKeywords) &&
+            parsedResult.newKeywords.every((kw: any) =>
+                typeof kw === 'object' && kw !== null && typeof kw.from === 'string' && typeof kw.to === 'string'
+            )
+        ) {
             return parsedResult;
         } else {
             console.error("Invalid JSON structure received:", parsedResult);
@@ -326,7 +445,7 @@ If no new keywords are identified, provide an empty array for "newKeywords".
         }
     } catch (error) {
         console.error("Failed to parse JSON response:", responseText, error);
-        throw new Error("Failed to parse JSON response from AI");
+        throw new Error(`Failed to parse JSON response from AI. Response text: ${responseText}`);
     }
 }
 
@@ -338,7 +457,7 @@ async function main() {
             await fs.mkdir(CACHE_DIR, { recursive: true }); // Ensure base cache dir exists
             await fs.mkdir(PROCESSED_CHAPTERS_DIR, { recursive: true });
             await fs.mkdir(TRANSLATED_CHAPTERS_DIR, { recursive: true });
-            // Keywords directory will be created by fetchAllKeywordsAndSave if needed
+            await fs.mkdir(TRANSLATION_STATE_DIR, { recursive: true }); // Ensure state dir exists
             console.log(`Ensured output directories exist.`);
         } catch (error) {
             console.error(`Failed to create output directories:`, error);
