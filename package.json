@@ -7,7 +7,9 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "build:start": "tsc && node dist/index.js"
+    "build:start": "tsc && node dist/index.js",
+    "chromadb": "cd ~/Documents/chroma && sudo docker run -d --rm --name chromadb -p 8000:8000 -v ./chroma:/chroma/chroma -e IS_PERSISTENT=TRUE -e ANONYMIZED_TELEMETRY=TRUE chromadb/chroma:0.5.20"
+
   },
   "keywords": [],
   "author": "",

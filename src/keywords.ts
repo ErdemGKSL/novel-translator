@@ -52,10 +52,12 @@ export const fetchAllKeywordsAndSave = async (collectionName: string): Promise<v
  * After adding, fetches all keywords and saves them to process/keywords/COLLECTION_NAME.json.
  * @param collectionName The name of the ChromaDB collection.
  * @param keyword The keyword object ({ from: string, to: string }) to add.
+ * @param skipSave Optional flag to skip saving the JSON backup after adding (default: false).
  */
 export const addKeywordDocument = async (
     collectionName: string,
-    keyword: Keyword
+    keyword: Keyword,
+    skipSave: boolean = false // Add skipSave parameter
 ) => {
     const collection = await getCollection(collectionName);
 
@@ -75,22 +77,171 @@ export const addKeywordDocument = async (
     }
 
     let addedSuccessfully = false;
+    const keywordId = keyword.from.toLowerCase().trim(); // Normalize ID
     try {
         // Add the document to the collection
         await collection.add({
-            ids: [keyword.from.toLowerCase().trim()], // Use 'from' as the ID
+            ids: [keywordId], // Use normalized 'from' as the ID
             embeddings: [embedding],
             metadatas: [keyword as any] // Store the original keyword object as metadata
         });
         addedSuccessfully = true;
-        console.log(`Keyword document added to ${collectionName} with ID: ${keyword.from}`);
-    } catch {}
+        console.log(`Keyword document added/updated in ${collectionName} with ID: ${keywordId}`);
+    } catch (error: any) {
+         // Handle potential duplicate ID errors or other issues gracefully
+        if (error.message?.includes('ID already exists')) {
+            console.warn(`Keyword with ID ${keywordId} already exists in ${collectionName}. Skipping addition.`);
+            // Optionally, you could implement an update logic here if needed
+        } else {
+            console.error(`Failed to add keyword ${keywordId} to ${collectionName}:`, error);
+            // Decide if you want to throw the error or just log it
+            // throw error;
+        }
+    }
 
-    // If added (or duplicate ignored), fetch all keywords and save to JSON
-    if (addedSuccessfully) {
+    // If added successfully and skipSave is false, fetch all keywords and save to JSON
+    if (addedSuccessfully && !skipSave) {
         // Call the extracted function
         await fetchAllKeywordsAndSave(collectionName);
     }
+};
+
+/**
+ * Synchronizes the ChromaDB collection with the keywords stored in the JSON backup file.
+ * It reads the JSON backup, fetches current keywords from the DB,
+ * and adds any keywords from the JSON that are missing in the DB or updates existing
+ * keywords if their 'to' value has changed.
+ * Uses upsert for efficiency.
+ * @param collectionName The name of the ChromaDB collection.
+ */
+export const syncKeywordsFromJson = async (collectionName: string): Promise<void> => {
+    console.log(`Starting keyword synchronization for collection: ${collectionName}`);
+    try {
+        // 1. Fetch current keywords from DB and store in a map for easy lookup
+        const collection = await getCollection(collectionName);
+        const currentDocs = await collection.get({ include: [IncludeEnum.Metadatas] });
+        const currentKeywordsMap = new Map<string, Keyword>();
+        currentDocs.ids.forEach((id, index) => {
+            const metadata = currentDocs.metadatas?.[index] as unknown as Keyword;
+            if (metadata && typeof metadata.from === 'string' && typeof metadata.to === 'string') {
+                currentKeywordsMap.set(id.toLowerCase().trim(), metadata); // Use normalized ID as key
+            }
+        });
+        console.log(`Found ${currentKeywordsMap.size} keywords currently in the database.`);
+
+        // 2. Read JSON backup
+        const keywordsDir = path.join(__dirname, '..', 'process', 'keywords');
+        const jsonFilePath = path.join(keywordsDir, `${collectionName}.json`);
+        let keywordsFromJson: Keyword[] = [];
+        try {
+            const jsonData = await fs.readFile(jsonFilePath, 'utf8');
+            keywordsFromJson = JSON.parse(jsonData);
+            console.log(`Read ${keywordsFromJson.length} keywords from JSON backup: ${jsonFilePath}`);
+        } catch (error: any) {
+            if (error.code === 'ENOENT') {
+                console.warn(`JSON backup file not found: ${jsonFilePath}. Cannot sync.`);
+                return; // Exit if no backup file exists
+            } else {
+                console.error(`Failed to read or parse JSON backup file ${jsonFilePath}:`, error);
+                throw error; // Re-throw other errors
+            }
+        }
+
+        // 3. Identify keywords to add or update (upsert)
+        const keywordsToUpsert: Keyword[] = [];
+        for (const keywordJson of keywordsFromJson) {
+            // Basic validation for keyword structure from JSON
+            if (!keywordJson || typeof keywordJson.from !== 'string' || typeof keywordJson.to !== 'string') {
+                console.warn('Skipping invalid keyword entry from JSON:', keywordJson);
+                continue;
+            }
+            const keywordIdJson = keywordJson.from.toLowerCase().trim(); // Normalize ID from JSON
+            const keywordDb = currentKeywordsMap.get(keywordIdJson);
+
+            // Add if missing OR if 'to' value is different
+            if (!keywordDb || keywordDb.to !== keywordJson.to) {
+                keywordsToUpsert.push(keywordJson);
+            }
+        }
+
+        // 4. Perform upsert if needed
+        if (keywordsToUpsert.length > 0) {
+            console.log(`Found ${keywordsToUpsert.length} keywords to add or update in the database. Processing upsert...`);
+
+            // Prepare data for bulk upsert
+            const ids: string[] = [];
+            const metadatas: any[] = [];
+            const embeddings: number[][] = []; // Array to hold generated embeddings
+
+            console.log(`Generating embeddings for ${keywordsToUpsert.length} keywords...`);
+            for (const kw of keywordsToUpsert) {
+                const keywordId = kw.from.toLowerCase().trim();
+                try {
+                    // Generate embedding for each keyword individually
+                    const result = await genAI.models.embedContent({
+                        model: "models/text-embedding-004",
+                        contents: kw.from // Use 'from' for embedding content
+                    });
+                    const embedding = result.embeddings?.[0].values;
+
+                    if (!embedding) {
+                        console.warn(`Failed to generate embedding for keyword ID: ${keywordId}. Skipping this keyword.`);
+                        continue; // Skip this keyword if embedding fails
+                    }
+
+                    // Add data for successful embedding generation
+                    ids.push(keywordId);
+                    metadatas.push(kw);
+                    embeddings.push(embedding);
+
+                } catch (embedError) {
+                    console.error(`Error generating embedding for keyword ID: ${keywordId}:`, embedError);
+                    // Optionally decide whether to stop the whole sync or just skip this keyword
+                    // For now, we skip the keyword by continuing the loop
+                    continue;
+                }
+            }
+            console.log(`Embeddings generated. Proceeding with upsert for ${ids.length} keywords.`);
+
+
+            // Check if there are any valid keywords left to upsert
+            if (ids.length === 0) {
+                 console.log("No valid keywords with embeddings to upsert after generation process.");
+                 // No need to call fetchAllKeywordsAndSave if nothing was actually upserted
+                 console.log(`Keyword synchronization finished for collection: ${collectionName}`);
+                 return;
+            }
+
+
+            try {
+                // Upsert the documents with generated embeddings
+                await collection.upsert({
+                    ids: ids,
+                    embeddings: embeddings,
+                    metadatas: metadatas
+                });
+                console.log(`Successfully upserted ${ids.length} keywords.`);
+
+                // 5. Save the consolidated list back to JSON *once* after successful upsert
+                await fetchAllKeywordsAndSave(collectionName);
+                console.log(`Updated JSON backup file after synchronization.`);
+
+            } catch (upsertError) {
+                 console.error(`Failed during bulk upsert operation for ${collectionName}:`, upsertError);
+                 // Decide how to handle bulk upsert errors
+                 throw upsertError; // Re-throw to indicate sync failure
+            }
+
+        } else {
+            console.log('Database is already in sync with the JSON backup.');
+        }
+
+    } catch (error) {
+        console.error(`Failed to synchronize keywords for ${collectionName}:`, error);
+        // Decide how to handle top-level errors during sync
+        // throw error;
+    }
+    console.log(`Keyword synchronization finished for collection: ${collectionName}`);
 };
 
 /**
@@ -105,7 +256,7 @@ export const addKeywordDocument = async (
 export const searchKeyword = async (
     collectionName: string,
     query: string,
-    nResults: number = 5
+    nResults?: number
 ): Promise<Keyword[]> => {
     const collection = await getCollection(collectionName);
 

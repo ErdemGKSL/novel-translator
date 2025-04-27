@@ -5,7 +5,7 @@ import { JSDOM } from 'jsdom'; // Import JSDOM
 
 import { Type } from '@google/genai';
 import { genAI } from './genai';
-import { searchKeyword, addKeywordDocument, fetchAllKeywordsAndSave } from './keywords';
+import { searchKeyword, addKeywordDocument, fetchAllKeywordsAndSave, syncKeywordsFromJson } from './keywords';
 
 // --- Constants ---
 const NOVEL_BASE_URL = "https://www.lightnovelworld.com/novel/the-dark-king-16091324";
@@ -18,7 +18,7 @@ const TRANSLATION_STATE_DIR = path.join(CACHE_DIR, 'chapters/translation-state')
 const COLLECTION_NAME = "the-dark-king-keywords"; // Example collection name
 const SOURCE_LANGUAGE = "English";
 const TARGET_LANGUAGE = "Turkish"; // Example target language
-const CONTEXT_WINDOW = 8; // Number of previous/future lines for context
+const CONTEXT_WINDOW = 5; // Number of previous/future lines for context
 
 // --- Caching Function ---
 async function cacheChapterUrls(): Promise<void> {
@@ -157,6 +157,7 @@ async function translateChapter(chapterNumber: number, sourceFilePath: string): 
     const stateFilePath = path.join(TRANSLATION_STATE_DIR, `chapter_${chapterNumber}.json`); // Path for the state file
     const MAX_RETRIES = 2; // Maximum number of retries for a single line
     const RETRY_DELAY_MS = 5000; // Delay between retries
+    let consecutiveFailures = 0; // Counter for consecutive translation failures
 
     console.log(`--- Translating Chapter ${chapterNumber} ---`);
 
@@ -290,12 +291,19 @@ async function translateChapter(chapterNumber: number, sourceFilePath: string): 
                                 previousLinesBuffer.shift();
                             }
                             success = true;
+                            consecutiveFailures = 0; // Reset counter on successful translation
                         } catch (lineError) {
                             attempts++;
                             console.error(`Error translating line ${i + 1} of Chapter ${chapterNumber} (Attempt ${attempts}/${MAX_RETRIES}):`, lineError);
                             if (attempts >= MAX_RETRIES) {
                                 console.error(`Max retries reached for line ${i + 1}. Marking as untranslated.`);
                                 currentTranslatedLine = `NOT TRANSLATED: ${currentLine}`;
+                                consecutiveFailures++; // Increment counter on final failure
+
+                                if (consecutiveFailures >= 5) {
+                                    console.error(`ERROR: 5 consecutive translation failures detected. Exiting process.`);
+                                    process.exit(1); // Exit if 5 consecutive failures occur
+                                }
                             } else {
                                 console.log(`Retrying in ${RETRY_DELAY_MS / 1000} seconds...`);
                                 await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS));
@@ -349,7 +357,7 @@ async function generateTranslatedLine(
 ): Promise<{ translatedLine: string; newKeywords: { from: string; to: string }[] }> {
     console.log(`Generating translation for line: "${currentLine}"`);
 
-    const existingKeywords = await searchKeyword(collectionName, currentLine, 5);
+    const existingKeywords = await searchKeyword(collectionName, currentLine, 15);
 
     const prompt = `
 You will be translating a novel line by line.
@@ -359,6 +367,13 @@ Maintain consistency with the "Previous Lines" translations and consider the "Fu
 Use the "Existing Keywords" for consistent translation of specific terms or names.
 Dont forget existing keywords are not absolutely correct, just use them as a reference for consistency.
 Identify any new recurring terms or names in the "Current Line" that should be translated consistently in the future and list them as "New Keywords".
+
+Dont forget that you are translating a novel, in turkish when you are saying statements, you can make them in past-like tense.
+For example, dont say 'Ancak, kalbi biraz rahatladı, en azından bir yol düşünmeye devam etmek için zamanı var.' instead say 'Ancak, kalbi biraz rahatladı, en azından bir yol düşünmeye devam etmek için zamanı vardı.'.
+You don't have to do it in every sentence, if it is not necessary, just do it in some sentences.
+
+You are a professional translator, so please make sure to use the correct grammar and punctuation in your translations.
+Also be aware that you are translating a novel, so the style should be consistent of source language's novel style. Because source language might have original novel writing style.
 
 Source Language: ${sourceLanguage}
 Target Language: ${targetLanguage}
@@ -419,6 +434,9 @@ If no new keywords are identified, provide an empty array for "newKeywords". Do 
                     }
                 },
                 required: ['translatedLine', 'newKeywords']
+            },
+            thinkingConfig: {
+                includeThoughts: true
             }
         }
     });
@@ -469,6 +487,7 @@ async function main() {
 
         // Fetch and save all existing keywords initially
         console.log("Performing initial keyword backup...");
+        await syncKeywordsFromJson(COLLECTION_NAME);
         await fetchAllKeywordsAndSave(COLLECTION_NAME);
         console.log("Initial keyword backup complete.");
 
