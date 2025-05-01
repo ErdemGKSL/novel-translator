@@ -357,7 +357,7 @@ async function generateTranslatedLine(
 ): Promise<{ translatedLine: string; newKeywords: { from: string; to: string }[] }> {
     console.log(`Generating translation for line: "${currentLine}"`);
 
-    const existingKeywords = await searchKeyword(collectionName, currentLine, 15);
+    const existingKeywords = await searchKeyword(collectionName, currentLine, 20);
 
     const prompt = `
 You will be translating a novel line by line.
