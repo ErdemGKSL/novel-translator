@@ -4,7 +4,7 @@ import path from 'path'; // Import path
 import { JSDOM } from 'jsdom'; // Import JSDOM
 
 import { Type } from '@google/genai';
-import { genAI } from './genai';
+import { clients, genAI, getNextClient } from './genai';
 import { searchKeyword, addKeywordDocument, fetchAllKeywordsAndSave, syncKeywordsFromJson } from './keywords';
 
 // --- Constants ---
@@ -311,7 +311,7 @@ async function translateChapter(chapterNumber: number, sourceFilePath: string): 
                         }
                     }
                     if (success || attempts >= MAX_RETRIES) {
-                        await new Promise(resolve => setTimeout(resolve, 5000));
+                        await new Promise(resolve => setTimeout(resolve, 6000 / clients.length));
                     }
                 }
             }
@@ -357,7 +357,7 @@ async function generateTranslatedLine(
 ): Promise<{ translatedLine: string; newKeywords: { from: string; to: string }[] }> {
     console.log(`Generating translation for line: "${currentLine}"`);
 
-    const existingKeywords = await searchKeyword(collectionName, currentLine, 20);
+    const existingKeywords = await searchKeyword(collectionName, currentLine, 25);
 
     const prompt = `
 You will be translating a novel line by line.
@@ -370,6 +370,8 @@ Identify any new recurring terms or names in the "Current Line" that should be t
 
 Dont forget that you are translating a novel, in turkish when you are saying statements, you can make them in past-like tense.
 For example, dont say 'Ancak, kalbi biraz rahatladı, en azından bir yol düşünmeye devam etmek için zamanı var.' instead say 'Ancak, kalbi biraz rahatladı, en azından bir yol düşünmeye devam etmek için zamanı vardı.'.
+
+When translating, make sure it feels natural in the target language.
 You don't have to do it in every sentence, if it is not necessary, just do it in some sentences.
 
 You are a professional translator, so please make sure to use the correct grammar and punctuation in your translations.
@@ -391,6 +393,8 @@ ${currentLine}
 
 Future Lines (for context):
 ${futureLines.map(line => `- ${line}`).join('\n') || 'None'}
+
+When translating dont forget to use the existing keywords if any related word is in the current line!!! IMPORTANT!!!
 
 Respond ONLY with a valid JSON object matching this schema:
 {
@@ -414,7 +418,10 @@ Respond ONLY with a valid JSON object matching this schema:
 If no new keywords are identified, provide an empty array for "newKeywords". Do not include any other text or explanations outside the JSON object.
 `;
 
-    const result = await genAI.models.generateContent({
+    // Use the key rotation system to get the next client for translation
+    const client = getNextClient("translation");
+    
+    const result = await client.models.generateContent({
         model: "models/gemini-2.5-flash-preview-04-17",
         contents: prompt,
         config: {
@@ -438,7 +445,8 @@ If no new keywords are identified, provide an empty array for "newKeywords". Do 
                 required: ['translatedLine', 'newKeywords']
             },
             thinkingConfig: {
-                includeThoughts: true
+                includeThoughts: true,
+                thinkingBudget: 1024
             }
         }
     });
